@@ -1,0 +1,24 @@
+name: vcore tick
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  actions: write
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: hit cron endpoint
+        run: curl -s -m 60 "$VCORE_URL/api/cron?key=$VCORE_KEY" || true
+        env:
+          VCORE_URL: https://vcore-coral.vercel.app
+          VCORE_KEY: ${{ secrets.VCORE_KEY }}
+      - name: re-trigger next tick (self-chaining, keeps free reminders on time)
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/tick.yml/dispatches" \
+            -d '{"ref":"main"}' || true

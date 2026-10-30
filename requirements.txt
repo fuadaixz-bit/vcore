@@ -1,0 +1,3 @@
+flask
+fpdf2
+requests
