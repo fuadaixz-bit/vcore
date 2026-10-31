@@ -478,9 +478,9 @@ def usage_check_and_add(uid, chars):
     return (True, used, limit)
 
 def key_pool():
-    """Main key + all admin-added keys."""
+    """Main keys + all admin-added keys, preserving order and avoiding duplicates."""
     d = mem_load()
-    return [k for k in ([os.environ.get("XKIRO_KEY", "")] + [k for k in (d.get("keys") or []) if k]) if k]
+    return list(dict.fromkeys(k for k in (XKIRO_KEYS + (d.get("keys") or [])) if k))
 _typing_on = set()
 
 def _typing_loop(cid):
@@ -489,6 +489,158 @@ def _typing_loop(cid):
         for _ in range(8):
             if cid not in _typing_on: return
             time.sleep(0.5)
+
+# ---------- Telegram owner-only admin panel ----------
+TELEGRAM_ADMIN_OWNER = "8602407906"
+
+def _admin_owner(update_message):
+    chat = update_message.get("chat") or {}
+    sender = update_message.get("from") or {}
+    return str(chat.get("id", "")) == TELEGRAM_ADMIN_OWNER and str(sender.get("id", "")) == TELEGRAM_ADMIN_OWNER
+
+def _admin_keyboard(rows=None):
+    if rows is None:
+        rows = [
+            [{"text": "create web user", "callback_data": "adm:create"}, {"text": "list users", "callback_data": "adm:users"}],
+            [{"text": "set daily limit", "callback_data": "adm:limits"}, {"text": "add Groq key", "callback_data": "adm:addkey"}],
+            [{"text": "list key pool", "callback_data": "adm:keys"}, {"text": "view stats", "callback_data": "adm:stats"}],
+        ]
+    return {"inline_keyboard": rows}
+
+def _admin_edit(chat_id, message_id, text, rows=None):
+    return tg_json("editMessageText", chat_id=chat_id, message_id=message_id,
+                   text=text, reply_markup=_admin_keyboard(rows))
+
+def _admin_pending_set(chat_id, value):
+    # Pending prompts live in memory.json so the next webhook instance can resume them.
+    with _MEM_LOCK:
+        _MEM_CACHE["data"] = None
+        _MEM_CACHE["at"] = 0
+    d = mem_load()
+    pending = d.setdefault("admin_pending", {})
+    if value is None:
+        pending.pop(str(chat_id), None)
+    else:
+        pending[str(chat_id)] = value
+    mem_save(d)
+
+def _admin_pending_get(chat_id):
+    with _MEM_LOCK:
+        _MEM_CACHE["data"] = None
+        _MEM_CACHE["at"] = 0
+    return (mem_load().get("admin_pending") or {}).get(str(chat_id))
+
+def _admin_home(chat_id, message_id, notice=""):
+    text = "V-CORE admin panel"
+    if notice: text += "\n\n" + notice
+    _admin_edit(chat_id, message_id, text)
+
+def _admin_users(chat_id, message_id):
+    d = mem_load(); today = _today(); users = d.get("users", [])
+    if not users: text = "users\n\nno web users yet"
+    else:
+        lines = ["web users"]
+        for u in users[:35]:
+            used = (u.get("usage") or {}).get(today, 0)
+            lim = u.get("limit", 100000)
+            lines.append("• " + str(u.get("id", "?")) + " | " + str(used) + "/" + ("unlimited" if lim < 0 else str(lim)))
+        if len(users) > 35: lines.append("...and " + str(len(users) - 35) + " more")
+        text = "\n".join(lines)
+    _admin_edit(chat_id, message_id, text, [[{"text": "back", "callback_data": "adm:home"}]])
+
+def _admin_limit_choices(chat_id, message_id):
+    users = mem_load().get("users", [])
+    rows = [[{"text": str(u.get("id", "?"))[:32], "callback_data": "adm:limit:" + str(u.get("id", ""))}] for u in users[:35]]
+    rows.append([{"text": "back", "callback_data": "adm:home"}])
+    _admin_edit(chat_id, message_id, "choose a user to set their daily character limit", rows)
+
+def _admin_keys(chat_id, message_id):
+    d = mem_load(); keys = d.get("keys") or []
+    lines = ["Groq key pool", "active keys including environment key: " + str(len(key_pool()))]
+    if keys:
+        lines.extend(str(i + 1) + ". " + k[:8] + "..." + k[-4:] for i, k in enumerate(keys))
+    else:
+        lines.append("no extra keys added")
+    _admin_edit(chat_id, message_id, "\n".join(lines), [[{"text": "back", "callback_data": "adm:home"}]])
+
+def _admin_stats(chat_id, message_id):
+    d = mem_load(); now = time.time()
+    users = len(d.get("users") or [])
+    keys = len(key_pool())
+    rems = sum(1 for r in (d.get("rems") or []) if r.get("at", 0) > now)
+    _admin_edit(chat_id, message_id, "stats\n\nusers: " + str(users) + "\nkeys: " + str(keys) + "\nactive reminders: " + str(rems),
+                [[{"text": "back", "callback_data": "adm:home"}]])
+
+def _admin_create_user(chat_id, message_id):
+    d = mem_load(); users = d.setdefault("users", [])
+    uid = "u" + secrets.token_hex(4)
+    while any(u.get("id") == uid for u in users): uid = "u" + secrets.token_hex(4)
+    pw = secrets.token_urlsafe(9)
+    users.append({"id": uid, "pw": hashlib.sha256(pw.encode()).hexdigest(), "limit": 100000, "usage": {}})
+    mem_save(d)
+    rows = [[{"text": "back to panel", "callback_data": "adm:home"}]]
+    _admin_edit(chat_id, message_id, "web user created\n\nid: " + uid + "\npassword: " + pw + "\ndaily limit: 100000 chars\n\ncopy the password now, it is shown only once", rows)
+
+def _admin_callback(query):
+    msg = query.get("message") or {}; chat_id = (msg.get("chat") or {}).get("id")
+    message_id = msg.get("message_id"); data = str(query.get("data") or "")
+    sender = query.get("from") or {}
+    if str(chat_id) != TELEGRAM_ADMIN_OWNER or str(sender.get("id", "")) != TELEGRAM_ADMIN_OWNER:
+        tg_json("answerCallbackQuery", callback_query_id=query.get("id"))
+        return
+    tg_json("answerCallbackQuery", callback_query_id=query.get("id"))
+    if not message_id: return
+    if data == "adm:home": _admin_pending_set(chat_id, None); _admin_home(chat_id, message_id)
+    elif data == "adm:create": _admin_pending_set(chat_id, None); _admin_create_user(chat_id, message_id)
+    elif data == "adm:users": _admin_pending_set(chat_id, None); _admin_users(chat_id, message_id)
+    elif data == "adm:limits": _admin_pending_set(chat_id, None); _admin_limit_choices(chat_id, message_id)
+    elif data.startswith("adm:limit:"):
+        uid = data[len("adm:limit:"):]
+        exists = any(u.get("id") == uid for u in mem_load().get("users", []))
+        if not exists: _admin_home(chat_id, message_id, "user not found")
+        else:
+            _admin_pending_set(chat_id, {"action": "setlimit", "uid": uid, "message_id": message_id})
+            _admin_edit(chat_id, message_id, "send the daily character limit for " + uid + " (use -1 for unlimited)",
+                        [[{"text": "cancel", "callback_data": "adm:home"}]])
+    elif data == "adm:addkey":
+        _admin_pending_set(chat_id, {"action": "addkey", "message_id": message_id})
+        _admin_edit(chat_id, message_id, "send the Groq API key in your next message. it will be stored in the key pool",
+                    [[{"text": "cancel", "callback_data": "adm:home"}]])
+    elif data == "adm:keys": _admin_pending_set(chat_id, None); _admin_keys(chat_id, message_id)
+    elif data == "adm:stats": _admin_pending_set(chat_id, None); _admin_stats(chat_id, message_id)
+
+def _admin_prompt_reply(message, text):
+    if not _admin_owner(message): return False
+    chat_id = (message.get("chat") or {}).get("id")
+    pending = _admin_pending_get(chat_id)
+    if not pending or pending.get("action") == "panel": return False
+    if text.strip().lower() in ("/cancel", "cancel"):
+        _admin_pending_set(chat_id, None)
+        _admin_edit(chat_id, pending.get("message_id"), "V-CORE admin panel")
+        return True
+    d = mem_load(); action = pending.get("action"); notice = ""
+    if action == "setlimit":
+        try: limit = int(text.strip())
+        except ValueError:
+            _admin_edit(chat_id, pending.get("message_id"), "limit ta whole number hote hobe. abar pathao, -1 = unlimited",
+                        [[{"text": "cancel", "callback_data": "adm:home"}]])
+            return True
+        user = next((u for u in d.get("users", []) if u.get("id") == pending.get("uid")), None)
+        if user:
+            user["limit"] = limit; mem_save(d); notice = "daily limit updated for " + str(user.get("id")) + ": " + str(limit)
+        else: notice = "user not found"
+    elif action == "addkey":
+        key = text.strip()
+        if not key or len(key) > 500:
+            _admin_edit(chat_id, pending.get("message_id"), "key ta valid text hisebe pelam na. abar pathao",
+                        [[{"text": "cancel", "callback_data": "adm:home"}]])
+            return True
+        keys = d.setdefault("keys", [])
+        if key not in keys: keys.append(key); mem_save(d); notice = "Groq key pool e add hoyeche"
+        else: notice = "ei key agei pool e ache"
+    _admin_pending_set(chat_id, None)
+    _admin_home(chat_id, pending.get("message_id"), notice)
+    return True
 
 def transcribe_voice(file_id):
     """Voice note -> text via Groq whisper (bn/en both)."""
@@ -515,6 +667,10 @@ def webhook():
         pass
     try: u = request.get_json(force=True)
     except Exception: return jsonify(ok=True)
+    cq = (u or {}).get("callback_query") or {}
+    if cq:
+        _admin_callback(cq)
+        return jsonify(ok=True)
     m = (u or {}).get("message") or {}
     t = (m.get("text") or "").strip()
     v = m.get("voice") or m.get("audio")
@@ -527,6 +683,29 @@ def webhook():
             return jsonify(ok=True)
         t = "[voice] " + t
     if t and cid is not None:
+        if _admin_owner(m):
+            cmd = t.split()[0].split("@")[0].lower()
+            if cmd == "/admin":
+                # Reuse the existing panel message when possible so navigation edits in place.
+                pending = _admin_pending_get(cid)
+                if pending and pending.get("message_id"):
+                    _admin_pending_set(cid, None)
+                    _admin_home(cid, pending.get("message_id"))
+                else:
+                    r = tg_json("sendMessage", chat_id=cid, text="V-CORE admin panel", reply_markup=_admin_keyboard())
+                    if r is not None and r.ok:
+                        try:
+                            mid = r.json().get("result", {}).get("message_id")
+                            if mid: _admin_pending_set(cid, {"action": "panel", "message_id": mid})
+                        except Exception: pass
+                _typing_on.discard(cid)
+                return jsonify(ok=True)
+            if _admin_prompt_reply(m, t):
+                _typing_on.discard(cid)
+                return jsonify(ok=True)
+        elif t.split()[0].split("@")[0].lower() == "/admin":
+            # Silently ignore all admin access from anyone other than the owner.
+            return jsonify(ok=True)
         _typing_on.add(cid)
         threading.Thread(target=_typing_loop, args=(cid,), daemon=True).start()
         out = ask(cid, t)
