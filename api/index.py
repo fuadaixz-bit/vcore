@@ -156,6 +156,53 @@ def run_file(payload, chat_id, code_override=None, user_text=None):
 
 _LIVE_HINTS = ("price", "dam", "koto taka", "koto", "today", "ajke", "ajk", "current", "rate", "news", "score", "weather", "btc", "bitcoin", "crypto", "dollar", "usd")
 
+
+def explicit_reminder_request(text):
+    """Only allow reminder actions when the user's message directly asks for one."""
+    low = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    # Routine/status mentions are not reminder instructions, even if they include a time.
+    if re.search(r"\bwake\s+up\s+(kori|kor|kore|hoi|hoy|hoyechi)\b", low):
+        return False
+    if re.search(r"\b(don't|dont|do not|no need to|not)\s+(remind|reminder|wake)\b", low):
+        return False
+    patterns = (
+        r"\b(remind|reminder)\s+me\b",
+        r"\b(set|make|create)\s+(me\s+)?a?\s*reminder\b",
+        r"\b(reminder)\s+(set|dao|daw|koro|kor|diyo|dio)\b",
+        r"\b(wake|wakeup)\s+me\b",
+        r"\b(wake|wakeup)\s+(me\s+)?(koro|kor|diyo|dio|up)\b",
+        r"\bwake\s+up\b.{0,24}\b(at|in)\s+\d+\b",
+        r"\b(mone\s+koriye|mone\s+koraiye|mone\s+korie)\s*(dio|diba|diyo|korio|koro|korba|kore\s+dio)\b",
+        r"\b(mone\s+kore)\s+(dio|diba|diyo|korio|koro|korba)\b",
+        r"\bremind\s+koria\s+(dio|diba|diyo|koro)\b",
+    )
+    return any(re.search(pattern, low) for pattern in patterns)
+
+
+def explicit_file_request(text):
+    """Only allow file delivery when the user explicitly asks to create or send a file."""
+    low = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    file_word = r"(file|document|doc|pdf|txt|csv|ebook|notes?)"
+    action = r"(banao|banai|banay|bana|create|make|write|generate|send|pathao|dao|daw)"
+    if re.search(r"\b(context|memory|profile)\s+document\b", low):
+        return False
+    return bool(
+        re.search(r"\b" + action + r"\b.{0,50}\b" + file_word + r"\b", low)
+        or re.search(r"\b" + file_word + r"\b.{0,35}\b(" + action + r"|chai|lagbe|dorkar)\b", low)
+        or re.search(r"\b(send|pathao|dao|daw)\s+(it|that|this|the\s+above)\b", low)
+    )
+
+
+def _ordinary_reply(msgs, fallback="bujhlam"):
+    """Convert a rejected tool tag into ordinary conversation without executing it."""
+    try:
+        reply = llm(msgs + [{"role": "user", "content": "Reply naturally to the user's original message. Do not use WEB, FILE, or REM tags, and do not take any tool action."}])
+        if reply and not extract_tag(reply)[0]:
+            return reply
+    except Exception:
+        pass
+    return fallback
+
 def ask(chat_id, text):
     h = HIST.setdefault(str(chat_id), [])
     h.append(("user", text))
@@ -169,9 +216,8 @@ def ask(chat_id, text):
     if open_rems:
         sys_full += "\n\nActive reminders (do not re-set these):\n" + "\n".join("- " + r["text"] for r in open_rems)
     msgs = [{"role": "system", "content": sys_full}] + [{"role": r, "content": c} for r, c in h]
-    # DETERMINISTIC reminder catch: parse time from the user's own words, brain never gets to ask "what time?"
-    _rem_words = ("remind", "reminder", "wake", "mone koria", "mone kore", "namaz", "remind koria")
-    if any(w in (text or "").lower() for w in _rem_words) and not any(r.get("cid") == str(chat_id) and time.time() - r.get("at", 0) < 120 for r in (md.get("rems") or [])):
+    # Only create a reminder when the user's own message explicitly requests one.
+    if explicit_reminder_request(text):
         got = parse_banglish_rem(text)
         if got:
             at, desc = got
@@ -204,7 +250,7 @@ def ask(chat_id, text):
         h.append(("assistant", reply)); h[:] = h[-30:]
         return reply
     tag, payload = extract_tag(out)
-    if tag == "REM":
+    if tag == "REM" and explicit_reminder_request(text):
         parts = payload.split("|", 1)
         at = parse_rem_time(parts[0]) if len(parts) > 1 else None
         if not at:
@@ -216,6 +262,10 @@ def ask(chat_id, text):
             reply = "reminder set: " + txt + " — " + w + " e"
         h.append(("assistant", reply)); h[:] = h[-30:]
         return reply
+    if tag == "REM":
+        out = _ordinary_reply(msgs, "bujhlam")
+        h.append(("assistant", out)); h[:] = h[-30:]
+        return out
     if tag == "WEB":
         result = web_search(payload[:150])
         msgs += [{"role": "assistant", "content": out},
@@ -224,14 +274,18 @@ def ask(chat_id, text):
         except Exception: pass
         h.append(("assistant", out)); h[:] = h[-30:]
         return out
-    if tag == "FILE":
+    if tag == "FILE" and explicit_file_request(text):
         err = run_file(payload, chat_id, user_text=text)
         reply = err or ("file ready 📄")
         h.append(("assistant", reply)); h[:] = h[-30:]
         return reply
+    if tag == "FILE":
+        out = _ordinary_reply(msgs, "bujhlam")
+        h.append(("assistant", out)); h[:] = h[-30:]
+        return out
     # HARD GUARD: user asked for a file/website but the brain pasted code as text instead of using FILE.
     # intercept the code and send it as a document anyway - never dump code in chat.
-    _make_ask = any(w in low for w in ("banao", "banai", "bana", "create", "make", "file", "pdf", "ebook", "document", "txt", "csv"))
+    _make_ask = explicit_file_request(text)
     if _make_ask:
         m_code = re.search(r"```(?:\w+)?\n(.*?)```", out, re.S)
         if m_code:
